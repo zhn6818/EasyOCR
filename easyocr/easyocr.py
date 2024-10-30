@@ -934,3 +934,5 @@ class ReaderRecog(object):
                                            blocklist, detail, rotation_info, paragraph, contrast_ths, 
                                            adjust_contrast, filter_ths, output_format)
         return result
+
+        
