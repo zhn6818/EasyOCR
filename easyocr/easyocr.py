@@ -577,3 +577,360 @@ class Reader(object):
                                             filter_ths, y_ths, x_ths, False, output_format))
 
         return result_agg
+    
+    def recognize_full_image(self, img_cv_grey, decoder='greedy', beamWidth=5,
+                             batch_size=1, workers=0, allowlist=None, blocklist=None,
+                             detail=1, rotation_info=None, paragraph=False,
+                             contrast_ths=0.1, adjust_contrast=0.5, filter_ths=0.003,
+                             output_format='standard'):
+        """
+        直接对输入的整张图片进行文字识别，无需进行检测。
+
+        Parameters:
+            img_cv_grey (numpy array): 输入的灰度图像数组
+            其他参数与原始 recognize 函数相同
+        """
+        # 不进行检测，因此直接对整张图片传入识别阶段
+        img, img_cv_grey = reformat_input(img_cv_grey)  # 确保图像格式正确
+
+        # 设置忽略字符
+        if allowlist:
+            ignore_char = ''.join(set(self.character) - set(allowlist))
+        elif blocklist:
+            ignore_char = ''.join(set(blocklist))
+        else:
+            ignore_char = ''.join(set(self.character) - set(self.lang_char))
+
+        # 直接创建图像列表，不再使用检测得到的框
+        y_max, x_max = img_cv_grey.shape
+        horizontal_list = [[0, x_max, 0, y_max]]
+        free_list = []
+
+        # 处理整张图片
+        image_list, max_width = get_image_list(horizontal_list, free_list, img_cv_grey, model_height=imgH)
+        result = get_text(self.character, imgH, int(max_width), self.recognizer, self.converter, image_list,
+                          ignore_char, decoder, beamWidth, batch_size, contrast_ths, adjust_contrast, filter_ths,
+                          workers, self.device)
+
+        if paragraph:
+            result = get_paragraph(result, x_ths=1.0, y_ths=0.5, mode='ltr')
+
+        # 根据格式化选项返回结果
+        if detail == 0:
+            return [item[1] for item in result]
+        elif output_format == 'dict':
+            return [{'boxes': item[0], 'text': item[1], 'confident': item[2]} for item in result]
+        elif output_format == 'json':
+            return [json.dumps({'boxes': [list(map(int, lst)) for lst in item[0]], 'text': item[1], 'confident': item[2]},
+                               ensure_ascii=False) for item in result]
+        else:
+            return result
+
+    def read_fulltext(self, image, decoder='greedy', beamWidth=5, batch_size=1,
+                      workers=0, allowlist=None, blocklist=None, detail=1,
+                      rotation_info=None, paragraph=False, contrast_ths=0.1,
+                      adjust_contrast=0.5, filter_ths=0.003, output_format='standard'):
+        """
+        直接读取图片中的文字，无需进行检测。
+        Parameters:
+            image (str or np.array): 图像文件路径或numpy数组
+            其他参数与 recognize_full_image 函数一致
+        """
+        # 将图像转换为灰度图格式
+        img, img_cv_grey = reformat_input(image)
+        result = self.recognize_full_image(img_cv_grey, decoder, beamWidth, batch_size, workers, allowlist,
+                                           blocklist, detail, rotation_info, paragraph, contrast_ths, 
+                                           adjust_contrast, filter_ths, output_format)
+        return result
+
+
+class ReaderRecog(object):
+    
+    def __init__(self, lang_list, gpu=True, model_storage_directory=None,
+                 user_network_directory=None, recog_network='standard', 
+                 download_enabled=True, recognizer=True, verbose=True, 
+                 quantize=True, cudnn_benchmark=False):
+        """Create a ReaderRecog for OCR Recognition
+
+        Parameters:
+            lang_list (list): Language codes (ISO 639) for languages to be recognized during analysis.
+            gpu (bool): Enable GPU support (default)
+            model_storage_directory (string): Path to directory for model data.
+            user_network_directory (string): Path to directory for custom network architecture.
+            download_enabled (bool): Enabled downloading of model data via HTTP (default).
+        """
+        self.verbose = verbose
+        self.download_enabled = download_enabled
+
+        self.model_storage_directory = MODULE_PATH + '/model'
+        if model_storage_directory:
+            self.model_storage_directory = model_storage_directory
+        Path(self.model_storage_directory).mkdir(parents=True, exist_ok=True)
+
+        self.user_network_directory = MODULE_PATH + '/user_network'
+        if user_network_directory:
+            self.user_network_directory = user_network_directory
+        Path(self.user_network_directory).mkdir(parents=True, exist_ok=True)
+        sys.path.append(self.user_network_directory)
+
+        if gpu is False:
+            self.device = 'cpu'
+            if verbose:
+                LOGGER.warning('Using CPU. Note: This module is much faster with a GPU.')
+        elif gpu is True:
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+            elif torch.backends.mps.is_available():
+                self.device = 'mps'
+            else:
+                self.device = 'cpu'
+                if verbose:
+                    LOGGER.warning('Neither CUDA nor MPS are available - defaulting to CPU. Note: This module is much faster with a GPU.')
+        else:
+            self.device = gpu
+
+        # self.detection_models = detection_models
+        self.recognition_models = recognition_models
+
+        # check and download detection model
+        # self.support_detection_network = ['craft', 'dbnet18']
+        self.quantize=quantize, 
+        self.cudnn_benchmark=cudnn_benchmark
+        # if detector:
+        #     detector_path = self.getDetectorPath(detect_network)
+        
+        # recognition model
+        separator_list = {}
+
+        if recog_network in ['standard'] + [model for model in recognition_models['gen1']] + [model for model in recognition_models['gen2']]:
+            if recog_network in [model for model in recognition_models['gen1']]:
+                model = recognition_models['gen1'][recog_network]
+                recog_network = 'generation1'
+                self.model_lang = model['model_script']
+            elif recog_network in [model for model in recognition_models['gen2']]:
+                model = recognition_models['gen2'][recog_network]
+                recog_network = 'generation2'
+                self.model_lang = model['model_script']
+            else: # auto-detect
+                unknown_lang = set(lang_list) - set(all_lang_list)
+                if unknown_lang != set():
+                    raise ValueError(unknown_lang, 'is not supported')
+                # choose recognition model
+                if lang_list == ['en']:
+                    self.setModelLanguage('english', lang_list, ['en'], '["en"]')
+                    model = recognition_models['gen2']['english_g2']
+                    recog_network = 'generation2'
+                elif 'th' in lang_list:
+                    self.setModelLanguage('thai', lang_list, ['th','en'], '["th","en"]')
+                    model = recognition_models['gen1']['thai_g1']
+                    recog_network = 'generation1'
+                elif 'ch_tra' in lang_list:
+                    self.setModelLanguage('chinese_tra', lang_list, ['ch_tra','en'], '["ch_tra","en"]')
+                    model = recognition_models['gen1']['zh_tra_g1']
+                    recog_network = 'generation1'
+                elif 'ch_sim' in lang_list:
+                    self.setModelLanguage('chinese_sim', lang_list, ['ch_sim','en'], '["ch_sim","en"]')
+                    model = recognition_models['gen2']['zh_sim_g2']
+                    recog_network = 'generation2'
+                elif 'ja' in lang_list:
+                    self.setModelLanguage('japanese', lang_list, ['ja','en'], '["ja","en"]')
+                    model = recognition_models['gen2']['japanese_g2']
+                    recog_network = 'generation2'
+                elif 'ko' in lang_list:
+                    self.setModelLanguage('korean', lang_list, ['ko','en'], '["ko","en"]')
+                    model = recognition_models['gen2']['korean_g2']
+                    recog_network = 'generation2'
+                elif 'ta' in lang_list:
+                    self.setModelLanguage('tamil', lang_list, ['ta','en'], '["ta","en"]')
+                    model = recognition_models['gen1']['tamil_g1']
+                    recog_network = 'generation1'
+                elif 'te' in lang_list:
+                    self.setModelLanguage('telugu', lang_list, ['te','en'], '["te","en"]')
+                    model = recognition_models['gen2']['telugu_g2']
+                    recog_network = 'generation2'
+                elif 'kn' in lang_list:
+                    self.setModelLanguage('kannada', lang_list, ['kn','en'], '["kn","en"]')
+                    model = recognition_models['gen2']['kannada_g2']
+                    recog_network = 'generation2'
+                elif set(lang_list) & set(bengali_lang_list):
+                    self.setModelLanguage('bengali', lang_list, bengali_lang_list+['en'], '["bn","as","en"]')
+                    model = recognition_models['gen1']['bengali_g1']
+                    recog_network = 'generation1'
+                elif set(lang_list) & set(arabic_lang_list):
+                    self.setModelLanguage('arabic', lang_list, arabic_lang_list+['en'], '["ar","fa","ur","ug","en"]')
+                    model = recognition_models['gen1']['arabic_g1']
+                    recog_network = 'generation1'
+                elif set(lang_list) & set(devanagari_lang_list):
+                    self.setModelLanguage('devanagari', lang_list, devanagari_lang_list+['en'], '["hi","mr","ne","en"]')
+                    model = recognition_models['gen1']['devanagari_g1']
+                    recog_network = 'generation1'
+                elif set(lang_list) & set(cyrillic_lang_list):
+                    self.setModelLanguage('cyrillic', lang_list, cyrillic_lang_list+['en'],
+                                          '["ru","rs_cyrillic","be","bg","uk","mn","en"]')
+                    model = recognition_models['gen2']['cyrillic_g2']
+                    recog_network = 'generation2'
+                else:
+                    self.model_lang = 'latin'
+                    model = recognition_models['gen2']['latin_g2']
+                    recog_network = 'generation2'
+            self.character = model['characters']
+
+            model_path = os.path.join(self.model_storage_directory, model['filename'])
+            # check recognition model file
+            if recognizer:
+                if os.path.isfile(model_path) == False:
+                    if not self.download_enabled:
+                        raise FileNotFoundError("Missing %s and downloads disabled" % model_path)
+                    LOGGER.warning('Downloading recognition model, please wait. '
+                                   'This may take several minutes depending upon your network connection.')
+                    download_and_unzip(model['url'], model['filename'], self.model_storage_directory, verbose)
+                    assert calculate_md5(model_path) == model['md5sum'], corrupt_msg
+                    LOGGER.info('Download complete.')
+                elif calculate_md5(model_path) != model['md5sum']:
+                    if not self.download_enabled:
+                        raise FileNotFoundError("MD5 mismatch for %s and downloads disabled" % model_path)
+                    LOGGER.warning(corrupt_msg)
+                    os.remove(model_path)
+                    LOGGER.warning('Re-downloading the recognition model, please wait. '
+                                   'This may take several minutes depending upon your network connection.')
+                    download_and_unzip(model['url'], model['filename'], self.model_storage_directory, verbose)
+                    assert calculate_md5(model_path) == model['md5sum'], corrupt_msg
+                    LOGGER.info('Download complete')
+            self.setLanguageList(lang_list, model)
+
+        else: # user-defined model
+            with open(os.path.join(self.user_network_directory, recog_network+ '.yaml'), encoding='utf8') as file:
+                recog_config = yaml.load(file, Loader=yaml.FullLoader)
+            
+            global imgH # if custom model, save this variable. (from *.yaml)
+            if recog_config['imgH']:
+                imgH = recog_config['imgH']
+                
+            available_lang = recog_config['lang_list']
+            self.setModelLanguage(recog_network, lang_list, available_lang, str(available_lang))
+            #char_file = os.path.join(self.user_network_directory, recog_network+ '.txt')
+            self.character = recog_config['character_list']
+            model_file = recog_network+ '.pth'
+            model_path = os.path.join(self.model_storage_directory, model_file)
+            self.setLanguageList(lang_list, recog_config)
+
+        dict_list = {}
+        for lang in lang_list:
+            dict_list[lang] = os.path.join(BASE_PATH, 'dict', lang + ".txt")
+
+        # if detector:
+        #     self.detector = self.initDetector(detector_path)
+            
+        if recognizer:
+            if recog_network == 'generation1':
+                network_params = {
+                    'input_channel': 1,
+                    'output_channel': 512,
+                    'hidden_size': 512
+                    }
+            elif recog_network == 'generation2':
+                network_params = {
+                    'input_channel': 1,
+                    'output_channel': 256,
+                    'hidden_size': 256
+                    }
+            else:
+                network_params = recog_config['network_params']
+            self.recognizer, self.converter = get_recognizer(recog_network, network_params,\
+                                                         self.character, separator_list,\
+                                                         dict_list, model_path, device = self.device, quantize=quantize)
+
+    def setModelLanguage(self, language, lang_list, list_lang, list_lang_string):
+        self.model_lang = language
+        if set(lang_list) - set(list_lang) != set():
+            if language == 'ch_tra' or language == 'ch_sim':
+                language = 'chinese'
+            raise ValueError(language.capitalize() + ' is only compatible with English, try lang_list=' + list_lang_string)
+
+    def getChar(self, fileName):
+        char_file = os.path.join(BASE_PATH, 'character', fileName)
+        with open(char_file, "r", encoding="utf-8-sig") as input_file:
+            list = input_file.read().splitlines()
+            char = ''.join(list)
+        return char
+    
+    def setLanguageList(self, lang_list, model):
+        self.lang_char = []
+        for lang in lang_list:
+            char_file = os.path.join(BASE_PATH, 'character', lang + "_char.txt")
+            with open(char_file, "r", encoding = "utf-8-sig") as input_file:
+                char_list =  input_file.read().splitlines()
+            self.lang_char += char_list
+        if model.get('symbols'):
+            symbol = model['symbols']
+        elif model.get('character_list'):
+            symbol = model['character_list']
+        else:
+            symbol = '0123456789!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~ '
+        self.lang_char = set(self.lang_char).union(set(symbol))
+        self.lang_char = ''.join(self.lang_char)
+
+    def recognize_full_image(self, img_cv_grey, decoder='greedy', beamWidth=5,
+                             batch_size=1, workers=0, allowlist=None, blocklist=None,
+                             detail=1, rotation_info=None, paragraph=False,
+                             contrast_ths=0.1, adjust_contrast=0.5, filter_ths=0.003,
+                             output_format='standard'):
+        """
+        直接对输入的整张图片进行文字识别，无需进行检测。
+
+        Parameters:
+            img_cv_grey (numpy array): 输入的灰度图像数组
+            其他参数与原始 recognize 函数相同
+        """
+        # 不进行检测，因此直接对整张图片传入识别阶段
+        img, img_cv_grey = reformat_input(img_cv_grey)  # 确保图像格式正确
+
+        # 设置忽略字符
+        if allowlist:
+            ignore_char = ''.join(set(self.character) - set(allowlist))
+        elif blocklist:
+            ignore_char = ''.join(set(blocklist))
+        else:
+            ignore_char = ''.join(set(self.character) - set(self.lang_char))
+
+        # 直接创建图像列表，不再使用检测得到的框
+        y_max, x_max = img_cv_grey.shape
+        horizontal_list = [[0, x_max, 0, y_max]]
+        free_list = []
+
+        # 处理整张图片
+        image_list, max_width = get_image_list(horizontal_list, free_list, img_cv_grey, model_height=imgH)
+        result = get_text(self.character, imgH, int(max_width), self.recognizer, self.converter, image_list,
+                          ignore_char, decoder, beamWidth, batch_size, contrast_ths, adjust_contrast, filter_ths,
+                          workers, self.device)
+
+        if paragraph:
+            result = get_paragraph(result, x_ths=1.0, y_ths=0.5, mode='ltr')
+
+        # 根据格式化选项返回结果
+        if detail == 0:
+            return [item[1] for item in result]
+        elif output_format == 'dict':
+            return [{'boxes': item[0], 'text': item[1], 'confident': item[2]} for item in result]
+        elif output_format == 'json':
+            return [json.dumps({'boxes': [list(map(int, lst)) for lst in item[0]], 'text': item[1], 'confident': item[2]},
+                               ensure_ascii=False) for item in result]
+        else:
+            return result
+
+    def read_fulltext(self, image, decoder='greedy', beamWidth=5, batch_size=1,
+                      workers=0, allowlist=None, blocklist=None, detail=1,
+                      rotation_info=None, paragraph=False, contrast_ths=0.1,
+                      adjust_contrast=0.5, filter_ths=0.003, output_format='standard'):
+        """
+        直接读取图片中的文字，无需进行检测。
+        Parameters:
+            image (str or np.array): 图像文件路径或numpy数组
+            其他参数与 recognize_full_image 函数一致
+        """
+        # 将图像转换为灰度图格式
+        img, img_cv_grey = reformat_input(image)
+        result = self.recognize_full_image(img_cv_grey, decoder, beamWidth, batch_size, workers, allowlist,
+                                           blocklist, detail, rotation_info, paragraph, contrast_ths, 
+                                           adjust_contrast, filter_ths, output_format)
+        return result
