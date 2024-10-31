@@ -935,4 +935,154 @@ class ReaderRecog(object):
                                            adjust_contrast, filter_ths, output_format)
         return result
 
+
+class ReaderDetect(object):
+    def __init__(self, gpu=True, model_storage_directory=None,
+                 user_network_directory=None, detect_network="craft",
+                 download_enabled=True, detector=True, verbose=True, 
+                 quantize=True, cudnn_benchmark=False):
+        """Create an EasyOCR Reader for Detection Only
+
+        Parameters:
+            gpu (bool): Enable GPU support (default)
+            model_storage_directory (string): Path to directory for model data.
+            user_network_directory (string): Path to directory for custom network architecture.
+            detect_network (str): Name of the detection network to use.
+            download_enabled (bool): Enabled downloading of model data via HTTP (default).
+        """
+        self.verbose = verbose
+        self.download_enabled = download_enabled
+        self.detect_network = detect_network
+        self.quantize = quantize
+        self.cudnn_benchmark = cudnn_benchmark
         
+        # Set storage directories
+        self.model_storage_directory = MODULE_PATH + '/model'
+        if model_storage_directory:
+            self.model_storage_directory = model_storage_directory
+        Path(self.model_storage_directory).mkdir(parents=True, exist_ok=True)
+
+        self.user_network_directory = MODULE_PATH + '/user_network'
+        if user_network_directory:
+            self.user_network_directory = user_network_directory
+        Path(self.user_network_directory).mkdir(parents=True, exist_ok=True)
+        sys.path.append(self.user_network_directory)
+
+        # Set device
+        if gpu is False:
+            self.device = 'cpu'
+            if verbose:
+                LOGGER.warning('Using CPU. Note: This module is much faster with a GPU.')
+        elif gpu is True:
+            if torch.cuda.is_available():
+                self.device = 'cuda'
+            elif torch.backends.mps.is_available():
+                self.device = 'mps'
+            else:
+                self.device = 'cpu'
+                if verbose:
+                    LOGGER.warning('Neither CUDA nor MPS are available - defaulting to CPU. Note: This module is much faster with a GPU.')
+        else:
+            self.device = gpu
+
+        self.detection_models = detection_models
+        # Initialize detection models
+        self.support_detection_network = ['craft', 'dbnet18']
+        if detector:
+            detector_path = self.getDetectorPath(detect_network)
+            self.detector = self.initDetector(detector_path)
+
+    def getDetectorPath(self, detect_network):
+        if detect_network in self.support_detection_network:
+            self.detect_network = detect_network
+            if self.detect_network == 'craft':
+                from .detection import get_detector, get_textbox
+            elif self.detect_network == 'dbnet18':
+                from .detection_db import get_detector, get_textbox
+            else:
+                raise RuntimeError("Unsupported detector network. Supported networks are craft and dbnet18.")
+            self.get_textbox = get_textbox
+            self.get_detector = get_detector
+            
+            corrupt_msg = 'MD5 hash mismatch, possible file corruption'
+            detector_path = os.path.join(self.model_storage_directory, self.detection_models[self.detect_network]['filename'])
+            
+            # Download model if needed
+            if os.path.isfile(detector_path) == False:
+                if not self.download_enabled:
+                    raise FileNotFoundError("Missing %s and downloads disabled" % detector_path)
+                LOGGER.warning('Downloading detection model, please wait. This may take several minutes depending upon your network connection.')
+                download_and_unzip(self.detection_models[self.detect_network]['url'], self.detection_models[self.detect_network]['filename'], self.model_storage_directory, self.verbose)
+                assert calculate_md5(detector_path) == self.detection_models[self.detect_network]['md5sum'], corrupt_msg
+                LOGGER.info('Download complete')
+            elif calculate_md5(detector_path) != self.detection_models[self.detect_network]['md5sum']:
+                if not self.download_enabled:
+                    raise FileNotFoundError("MD5 mismatch for %s and downloads disabled" % detector_path)
+                LOGGER.warning(corrupt_msg)
+                os.remove(detector_path)
+                LOGGER.warning('Re-downloading the detection model, please wait. This may take several minutes depending upon your network connection.')
+                download_and_unzip(self.detection_models[self.detect_network]['url'], self.detection_models[self.detect_network]['filename'], self.model_storage_directory, self.verbose)
+                assert calculate_md5(detector_path) == self.detection_models[self.detect_network]['md5sum'], corrupt_msg
+        else:
+            raise RuntimeError("Unsupported detector network. Supported networks are {}.".format(', '.join(self.support_detection_network)))
+        
+        return detector_path
+
+    def initDetector(self, detector_path):
+        return self.get_detector(detector_path, 
+                                 device=self.device, 
+                                 quantize=self.quantize, 
+                                 cudnn_benchmark=self.cudnn_benchmark)
+
+    def detect(self, img, min_size=20, text_threshold=0.7, low_text=0.4,
+               link_threshold=0.4, canvas_size=2560, mag_ratio=1.0,
+               slope_ths=0.1, ycenter_ths=0.5, height_ths=0.5,
+               width_ths=0.5, add_margin=0.1, reformat=True,
+               threshold=0.2, bbox_min_score=0.2, bbox_min_size=3, max_candidates=0):
+        """
+        Detect text regions in the image.
+
+        Parameters:
+            img (numpy array): Input image.
+            Other parameters control the detection thresholds and margins.
+
+        Returns:
+            horizontal_list_agg, free_list_agg: Detected text boxes in horizontal and free form.
+        """
+        if reformat:
+            img, img_cv_grey = reformat_input(img)
+
+        text_box_list = self.get_textbox(self.detector, 
+                                         img, 
+                                         canvas_size=canvas_size, 
+                                         mag_ratio=mag_ratio,
+                                         text_threshold=text_threshold, 
+                                         link_threshold=link_threshold, 
+                                         low_text=low_text,
+                                         poly=False, 
+                                         device=self.device, 
+                                         optimal_num_chars=None,
+                                         threshold=threshold, 
+                                         bbox_min_score=bbox_min_score, 
+                                         bbox_min_size=bbox_min_size, 
+                                         max_candidates=max_candidates)
+
+        horizontal_list_agg, free_list_agg = [], []
+        for text_box in text_box_list:
+            horizontal_list, free_list = group_text_box(text_box, slope_ths,
+                                                        ycenter_ths, height_ths,
+                                                        width_ths, add_margin,
+                                                        True)
+            if min_size:
+                horizontal_list = [i for i in horizontal_list if max(
+                    i[1] - i[0], i[3] - i[2]) > min_size]
+                free_list = [i for i in free_list if max(
+                    diff([c[0] for c in i]), diff([c[1] for c in i])) > min_size]
+            horizontal_list_agg.append(horizontal_list)
+            free_list_agg.append(free_list)
+
+        return horizontal_list_agg, free_list_agg
+    def detect_img(self, image, **kwargs):
+        img, img_cv_grey = reformat_input(image)
+        horizontal_list, free_list = self.detect(img,**kwargs)
+        return horizontal_list, free_list
