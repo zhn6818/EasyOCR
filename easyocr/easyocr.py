@@ -1083,6 +1083,6 @@ class ReaderDetect(object):
 
         return horizontal_list_agg, free_list_agg
     def detect_img(self, image, **kwargs):
-        img, img_cv_grey = reformat_input(image)
-        horizontal_list, free_list = self.detect(img,**kwargs)
+        # img, img_cv_grey = reformat_input(image)
+        horizontal_list, free_list = self.detect(image,**kwargs)
         return horizontal_list, free_list
